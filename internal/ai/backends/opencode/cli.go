@@ -1,7 +1,10 @@
 package opencode
 
 import (
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 
 	"clawbench/internal/ai"
 	"clawbench/internal/ai/backends"
@@ -81,12 +84,9 @@ func OpenCodeFilterLine(line string) (string, bool) {
 	return line, true
 }
 
-// BuildOpenCodeStreamArgs constructs the CLI arguments for OpenCode streaming.
-// Exported for reuse by MiMo-Code and any other OpenCode-fork backends.
-func BuildOpenCodeStreamArgs(req ai.ChatRequest) []string {
-	// OpenCode CLI has no --system-prompt flag — inject into user prompt.
-	prompt := ai.InjectSystemPrompt(req)
-
+// buildOpenCodeStreamArgsV1 builds args for OpenCode v1.x (npm opencode-ai):
+// `run` accepts --dir, --dangerously-skip-permissions and --variant.
+func buildOpenCodeStreamArgsV1(req ai.ChatRequest, prompt string) []string {
 	args := []string{
 		"run",
 		prompt,
@@ -119,4 +119,102 @@ func BuildOpenCodeStreamArgs(req ai.ChatRequest) []string {
 	}
 
 	return args
+}
+
+// buildOpenCodeStreamArgsV2 builds args for OpenCode v2.x: `run` dropped
+// --dir (the process working directory applies — CLIBackend already sets
+// cmd.Dir), --dangerously-skip-permissions (replaced by --auto) and
+// --variant (thinking effort now travels inside --model as model#variant).
+// The prompt is placed after a "--" end-of-flags separator because citty
+// treats any leading-dash argument as flags (e.g. a user message starting
+// with "- 功能测试" would otherwise be parsed as clustered short flags).
+func buildOpenCodeStreamArgsV2(req ai.ChatRequest, prompt string) []string {
+	args := []string{
+		"run",
+		"--format", "json",
+		"--auto",
+	}
+
+	if req.SessionID != "" && req.Resume {
+		args = append(args, "--session", req.SessionID)
+	}
+
+	if req.Model != "" {
+		model := req.Model
+		// v2 variant ids are none/minimal/low/medium/high/xhigh — clawbench's
+		// "max" maps to v2's top reasoning tier "xhigh".
+		if req.ThinkingEffort != "" {
+			variant := req.ThinkingEffort
+			if variant == "max" {
+				variant = "xhigh"
+			}
+			model += "#" + variant
+		}
+		args = append(args, "--model", model)
+	}
+
+	args = append(args, "--", prompt)
+	return args
+}
+
+// opencodeMajorVersion caches the detected major version of the `opencode`
+// binary so BuildOpenCodeStreamArgsV2 can pick the right flag set. Defaults
+// to 1 when detection fails (e.g. opencode not on PATH).
+var (
+	opencodeMajorVersion     = 1
+	opencodeMajorVersionOnce sync.Once
+)
+
+// parseOpenCodeMajorVersion extracts the major version from `opencode --version`
+// output (e.g. "opencode v2.0.18" → 2). Returns 1 when unparseable so unknown
+// binaries keep the v1 flag set.
+func parseOpenCodeMajorVersion(output string) int {
+	for _, field := range strings.Fields(output) {
+		ver, ok := strings.CutPrefix(field, "v")
+		if !ok {
+			// Accept a bare "N.x.y" token as well, e.g. "opencode 2.0.18".
+			if major, _, found := strings.Cut(field, "."); found {
+				if n, err := strconv.Atoi(major); err == nil {
+					return n
+				}
+			}
+			continue
+		}
+		major, _, _ := strings.Cut(ver, ".")
+		if n, err := strconv.Atoi(major); err == nil {
+			return n
+		}
+		return 1
+	}
+	return 1
+}
+
+func detectOpenCodeMajorVersion() {
+	opencodeMajorVersionOnce.Do(func() {
+		out, err := exec.Command("opencode", "--version").Output()
+		if err != nil {
+			return
+		}
+		opencodeMajorVersion = parseOpenCodeMajorVersion(string(out))
+	})
+}
+
+// buildStreamArgs picks the flag set for the given opencode major version.
+func buildStreamArgs(req ai.ChatRequest, prompt string, majorVersion int) []string {
+	if majorVersion >= 2 {
+		return buildOpenCodeStreamArgsV2(req, prompt)
+	}
+	return buildOpenCodeStreamArgsV1(req, prompt)
+}
+
+// BuildOpenCodeStreamArgs constructs the CLI arguments for OpenCode streaming.
+// Exported for reuse by MiMo-Code and any other OpenCode-fork backends.
+// OpenCode v2 removed several `run` flags — dispatch on the detected binary
+// version so both v1 and v2 installs keep working.
+func BuildOpenCodeStreamArgs(req ai.ChatRequest) []string {
+	// OpenCode CLI has no --system-prompt flag — inject into user prompt.
+	prompt := ai.InjectSystemPrompt(req)
+
+	detectOpenCodeMajorVersion()
+	return buildStreamArgs(req, prompt, opencodeMajorVersion)
 }
